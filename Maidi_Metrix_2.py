@@ -1,0 +1,1257 @@
+import asyncio
+import logging
+import os
+import json
+import re
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+from uuid import uuid4
+
+import pytz
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    ContextTypes,
+)
+
+# ========== НАСТРОЙКА ==========
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ========== ЧАСОВОЙ ПОЯС ==========
+MSK = pytz.timezone("Europe/Moscow")
+
+# ========== ФАЙЛ ДЛЯ ХРАНЕНИЯ ==========
+# Используем абсолютный путь для записи в рабочую директорию
+DATA_FILE = os.path.join(os.getcwd(), "data.json")
+
+# ========== ХРАНИЛИЩА ==========
+users_db: Dict[int, dict] = {}
+projects_db: Dict[str, dict] = {}
+tasks_db: Dict[str, dict] = {}
+
+# ========== СОСТОЯНИЯ ==========
+(
+    CREATE_PROJECT_NAME,
+    CREATE_TASK_SELECT_USER,
+    CREATE_TASK_TITLE,
+    CREATE_TASK_DEADLINE,
+    POSTPONE_REQUEST_REASON,
+    TL_APPROVE_NEW_DEADLINE,
+    EDIT_PROJECT_NAME,
+    EDIT_TASK_SELECT,
+    EDIT_TASK_TITLE,
+    EDIT_TASK_DEADLINE,
+    EDIT_TASK_ASSIGNEE,
+) = range(11)
+
+# ========== ЯНДЕКС МЕТРИКА (АСИНХРОННАЯ ВЕРСИЯ) ==========
+YA_METRIKA_COUNTER_ID = int(os.environ.get("YA_METRIKA_COUNTER_ID", 0))
+YA_METRIKA_MP_TOKEN = os.environ.get("YA_METRIKA_MP_TOKEN", "")
+
+def send_to_metrika_sync(user_id: int, event_url: str, event_title: str, event_params: dict = None):
+    """Синхронная отправка (выполняется в отдельном потоке)."""
+    if not YA_METRIKA_COUNTER_ID or not YA_METRIKA_MP_TOKEN:
+        return
+    base_url = f"https://mc.yandex.ru/collect/?tid={YA_METRIKA_COUNTER_ID}&cid={user_id}&t=pageview"
+    full_url = f"{base_url}&dl={event_url}&dt={event_title}"
+    if event_params:
+        for key, value in event_params.items():
+            full_url += f"&{key}={value}"
+    full_url += f"&ms={YA_METRIKA_MP_TOKEN}"
+    try:
+        requests.get(full_url, timeout=2)
+    except Exception:
+        pass
+
+async def send_to_metrika(user_id: int, event_url: str, event_title: str, event_params: dict = None):
+    """Асинхронная обёртка – не блокирует событийный цикл."""
+    await asyncio.to_thread(send_to_metrika_sync, user_id, event_url, event_title, event_params)
+
+# ========== ПЕРСИСТЕНТНОСТЬ ==========
+def save_data():
+    data = {
+        "users_db": users_db,
+        "projects_db": projects_db,
+        "tasks_db": tasks_db,
+    }
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения данных: {e}")
+
+def load_data():
+    global users_db, projects_db, tasks_db
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            users_db = {int(k): v for k, v in data.get("users_db", {}).items()}
+            projects_db = data.get("projects_db", {})
+            tasks_db = data.get("tasks_db", {})
+            for tid, task in tasks_db.items():
+                if isinstance(task.get("deadline"), str):
+                    dt = datetime.fromisoformat(task["deadline"])
+                    if dt.tzinfo is None:
+                        dt = MSK.localize(dt)
+                    task["deadline"] = dt
+            logger.info("Данные загружены")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки данных: {e}")
+    else:
+        logger.info("Файл данных не найден, начинаем с пустых баз.")
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def reset_calendar_data(context: ContextTypes.DEFAULT_TYPE):
+    for key in ["cal_year", "cal_month", "cal_date", "calendar_for_edit", "calendar_next_state",
+                "creating_task", "temp_assignee_id", "temp_project_id", "temp_task_title",
+                "temp_assign_all", "new_deadline", "approve_task_id", "edit_task_id", "awaiting_time"]:
+        context.user_data.pop(key, None)
+
+def generate_invite_code() -> str:
+    return uuid4().hex[:8].upper()
+
+def get_user_link(user_id: int) -> str:
+    user = users_db.get(user_id, {})
+    username = user.get("username")
+    if username:
+        return f"@{username}"
+    return f"[пользователь](tg://user?id={user_id})"
+
+def format_deadline(dt: datetime) -> str:
+    return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+
+def parse_deadline(date_str: str, time_str: str = "23:59") -> Optional[datetime]:
+    try:
+        if " " in date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+        else:
+            dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        return MSK.localize(dt)
+    except Exception:
+        return None
+
+def get_main_keyboard():
+    keyboard = [
+        [KeyboardButton("📁 Мои проекты")],
+        [KeyboardButton("✨ Создать проект"), KeyboardButton("🔗 Вступить в проект")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# ========== УВЕДОМЛЕНИЯ И ПЛАНИРОВЩИК ==========
+async def send_notification_to_project(context, project_id, text, exclude_user_id=None, reply_markup=None):
+    project = projects_db.get(project_id)
+    if not project:
+        return
+    for member_id in project["members"]:
+        if member_id == exclude_user_id:
+            continue
+        try:
+            await context.bot.send_message(chat_id=member_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Не удалось отправить {member_id}: {e}")
+
+async def schedule_reminders(context, task_id):
+    task = tasks_db.get(task_id)
+    if not task or task["completed"]:
+        logger.info(f"Напоминания не запланированы: задача {task_id} не найдена или выполнена")
+        return
+    deadline = task["deadline"]
+    now = datetime.now(MSK)
+    if deadline <= now:
+        logger.warning(f"Дедлайн {deadline} уже прошёл (сейчас {now}), напоминания не будут созданы")
+        return
+
+    logger.info(f"Планируем напоминания для задачи {task_id}, дедлайн {deadline}")
+    # удаляем старые
+    if context.job_queue:
+        for job in context.job_queue.jobs():
+            if job.name and job.name.startswith(f"reminder_{task_id}_"):
+                job.schedule_removal()
+                logger.info(f"Удалена старая задача {job.name}")
+    for hours in [72, 48, 24, 4]:
+        remind_time = deadline - timedelta(hours=hours)
+        if remind_time > now and context.job_queue:
+            context.job_queue.run_once(send_reminder, when=remind_time, data={"task_id": task_id, "hours": hours}, name=f"reminder_{task_id}_{hours}h")
+            logger.info(f"Запланировано напоминание через {hours} час(ов) на {remind_time}")
+        else:
+            logger.info(f"Время напоминания за {hours} час(ов) уже прошло, не планируем")
+
+async def send_reminder(context):
+    data = context.job.data
+    logger.info(f"Вызвано напоминание для задачи {data['task_id']}, hours={data['hours']}")
+    task = tasks_db.get(data["task_id"])
+    if not task or task["completed"]:
+        return
+
+    await send_to_metrika(task["assignee_id"], "/reminder_received", "Напоминание о дедлайне",
+                         {"hours_before": data["hours"], "task_id": data["task_id"]})
+
+    assignee = task["assignee_id"]
+    project = projects_db.get(task["project_id"])
+    if not project:
+        return
+    text = f"🔔 <b>Напоминание о дедлайне!</b>\n\nПроект: {project['name']}\nЗадача: {task['title']}\nДедлайн: {format_deadline(task['deadline'])}\nОсталось: {data['hours']} час(а)."
+    reply_markup = None
+    if data["hours"] == 4:
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⏰ Напомнить позже", callback_data=f"postpone_reminder_{task['id']}")]])
+    await context.bot.send_message(chat_id=assignee, text=text, reply_markup=reply_markup, parse_mode="HTML")
+
+async def postpone_reminder_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    if not tasks_db.get(task_id):
+        await query.edit_message_text("Задача не найдена.")
+        return
+    keyboard = [
+        [InlineKeyboardButton("через 1 час", callback_data=f"delay_1h_{task_id}")],
+        [InlineKeyboardButton("через 2 часа", callback_data=f"delay_2h_{task_id}")],
+        [InlineKeyboardButton("через 3 часа", callback_data=f"delay_3h_{task_id}")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        "Выберите, через сколько напомнить:",
+        reply_markup=reply_markup
+    )
+
+async def delay_reminder_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("_")
+    hours = int(parts[1].replace("h", ""))
+    task_id = parts[2]
+    task = tasks_db.get(task_id)
+    if not task:
+        await query.edit_message_text("Задача не найдена.")
+        return
+
+    await send_to_metrika(update.effective_user.id, "/reminder_snoozed", "Откладывание напоминания",
+                         {"hours": hours, "task_id": task_id})
+
+    if context.job_queue:
+        for job in context.job_queue.jobs():
+            if job.name == f"reminder_{task_id}_4h":
+                job.schedule_removal()
+                break
+        new_time = datetime.now(MSK) + timedelta(hours=hours)
+        context.job_queue.run_once(send_reminder, when=new_time, data={"task_id": task_id, "hours": hours}, name=f"reminder_{task_id}_delayed_{hours}h")
+    await query.edit_message_text(f"✅ Напомню о задаче «{task['title']}» через {hours} час(а).")
+
+# ========== ОСНОВНЫЕ КОМАНДЫ ==========
+async def start(update, context):
+    user = update.effective_user
+    users_db[user.id] = {"username": user.username, "full_name": user.full_name}
+    save_data()
+
+    await send_to_metrika(user.id, "/start", "Запуск бота")
+
+    # Обработка пригласительной ссылки
+    if context.args and context.args[0].startswith("invite_"):
+        code = context.args[0][7:]  # убираем "invite_"
+        for pid, proj in projects_db.items():
+            if proj["invite_code"] == code:
+                if user.id not in proj["members"]:
+                    proj["members"].append(user.id)
+                    save_data()
+                    await update.message.reply_text(f"✅ Вы присоединились к проекту «{proj['name']}»!")
+                    await notify_owner_about_new_member(context, pid, user.id)
+                else:
+                    await update.message.reply_text(f"Вы уже в проекте «{proj['name']}».")
+                break
+        else:
+            await update.message.reply_text("Неверная ссылка приглашения.")
+        return
+
+    text = (
+        f"Привет, {user.first_name}!\n\n"
+        "Я бот-помощник для управления задачами в студенческих проектах.\n"
+        "Используйте кнопки меню для навигации: создавайте проекты, смотрите задачи и напоминайте о дедлайнах автоматически."
+    )
+    await update.message.reply_text(text, reply_markup=get_main_keyboard())
+
+async def help_command(update, context):
+    user_id = update.effective_user.id
+    await send_to_metrika(user_id, "/help", "Открытие справки")
+    text = "<b>Справка</b>\n\n" \
+           "📁 Мои проекты – список ваших проектов и задач\n" \
+           "✨ Создать проект – стать тимлидом нового проекта\n" \
+           "🔗 Вступить в проект – присоединиться по коду или ссылке\n\n" \
+           "Напоминания за 72/48/24/4 часа, кнопка отсрочки за 4 часа."
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+async def handle_menu_buttons(update, context):
+    text = update.message.text
+    if text == "📁 Мои проекты":
+        await my_projects(update, context)
+    elif text == "🔗 Вступить в проект":
+        await update.message.reply_text("Отправьте код приглашения или ссылку.\nПример: /join КОД")
+    # "✨ Создать проект" обрабатывается ConversationHandler
+
+async def assign_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    reset_calendar_data(context)
+    project_id = context.user_data.get("current_project_id")
+    if not project_id:
+        await query.edit_message_text("Ошибка: проект не найден.")
+        return
+    context.user_data["creating_task"] = True
+    context.user_data["temp_assign_all"] = True
+    context.user_data["temp_project_id"] = project_id
+    await query.edit_message_text("Введите название задачи (будет создана для всех):")
+
+async def notify_owner_about_new_member(context, project_id: str, new_member_id: int):
+    project = projects_db.get(project_id)
+    if not project:
+        return
+    owner_id = project["owner_id"]
+    if owner_id == new_member_id:
+        return
+    new_member = users_db.get(new_member_id, {})
+    member_name = new_member.get("full_name") or new_member.get("username") or str(new_member_id)
+    text = f"👋 <b>Новый участник в проекте «{project['name']}»!</b>\n\n{member_name} присоединился к проекту."
+    try:
+        await context.bot.send_message(chat_id=owner_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление владельцу {owner_id}: {e}")
+
+async def handle_task_creation_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("creating_task"):
+        await handle_menu_buttons(update, context)
+        return
+
+    text = update.message.text
+    if text in ["📁 Мои проекты", "✨ Создать проект", "🔗 Вступить в проект"]:
+        reset_calendar_data(context)
+        await handle_menu_buttons(update, context)
+        return
+
+    title = text.strip()
+    if not title:
+        await update.message.reply_text("Название не может быть пустым.")
+        return
+
+    context.user_data["temp_task_title"] = title
+    context.user_data["calendar_next_state"] = "task_creation"
+    await show_calendar(update, context, for_edit=False)
+
+# ОБЪЕДИНЁННЫЙ ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ
+async def unified_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_time"):
+        await handle_time_input(update, context)
+    elif context.user_data.get("creating_task"):
+        await handle_task_creation_text(update, context)
+    else:
+        await handle_menu_buttons(update, context)
+
+# ========== СОЗДАНИЕ ПРОЕКТА ==========
+async def new_project_start(update, context):
+    await update.message.reply_text("Введите название проекта:")
+    return CREATE_PROJECT_NAME
+
+async def new_project_name(update, context):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Название не может быть пустым.")
+        return CREATE_PROJECT_NAME
+    user_id = update.effective_user.id
+
+    await send_to_metrika(user_id, "/project_created", "Создание проекта", {"project_name": name[:50]})
+
+    project_id = str(uuid4())
+    code = generate_invite_code()
+    bot_info = await context.bot.get_me()
+    invite_link = f"https://t.me/{bot_info.username}?start=invite_{code}"
+    projects_db[project_id] = {
+        "name": name,
+        "owner_id": user_id,
+        "invite_code": code,
+        "members": [user_id]
+    }
+    save_data()
+    await update.message.reply_text(
+        f"✅ Проект «{name}» создан!\n"
+        f"🔗 Ссылка-приглашение: {invite_link}\n"
+        f"📋 Код приглашения: <code>{code}</code>\n"
+        f"Участники могут присоединиться по ссылке или команде /join {code}",
+        parse_mode="HTML", reply_markup=get_main_keyboard()
+    )
+    return ConversationHandler.END
+
+async def cancel(update, context):
+    await update.message.reply_text("Отменено.", reply_markup=get_main_keyboard())
+    return ConversationHandler.END
+
+async def join_project(update, context):
+    if not context.args:
+        await update.message.reply_text("Укажите код или перейдите по ссылке-приглашению.\nПример: /join КОД")
+        return
+    code = context.args[0].upper()
+    user_id = update.effective_user.id
+    for pid, proj in projects_db.items():
+        if proj["invite_code"] == code:
+            if user_id in proj["members"]:
+                await update.message.reply_text(f"Вы уже в проекте «{proj['name']}».")
+            else:
+                proj["members"].append(user_id)
+                save_data()
+                await update.message.reply_text(f"✅ Вы присоединились к проекту «{proj['name']}»!")
+                await notify_owner_about_new_member(context, pid, user_id)
+
+                await send_to_metrika(user_id, "/project_joined", "Вступление в проект", {"project_name": proj['name'][:50]})
+            return
+    await update.message.reply_text("Неверный код.")
+
+async def my_projects(update, context):
+    user_id = update.effective_user.id
+    await send_to_metrika(user_id, "/projects_list", "Просмотр списка проектов")
+
+    user_projects = [(pid, proj) for pid, proj in projects_db.items() if user_id in proj["members"]]
+    if not user_projects:
+        await update.message.reply_text("Вы не участвуете ни в одном проекте.", reply_markup=get_main_keyboard())
+        return
+    keyboard = []
+    for pid, proj in user_projects:
+        row = [InlineKeyboardButton(proj["name"], callback_data=f"select_project_{pid}")]
+        if proj["owner_id"] == user_id:
+            row.append(InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_project_{pid}"))
+            row.append(InlineKeyboardButton("🗑️ Удалить", callback_data=f"delete_project_{pid}"))
+        keyboard.append(row)
+    await update.message.reply_text("Выберите проект:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# ========== УПРАВЛЕНИЕ ПРОЕКТАМИ (ред/удал) ==========
+async def edit_project_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    project_id = query.data.split("_")[-1]
+    project = projects_db.get(project_id)
+    if not project or project["owner_id"] != update.effective_user.id:
+        await query.edit_message_text("Нет прав на редактирование.")
+        return
+    context.user_data["edit_project_id"] = project_id
+    await query.edit_message_text("Введите новое название проекта:")
+    return EDIT_PROJECT_NAME
+
+async def edit_project_name(update, context):
+    new_name = update.message.text.strip()
+    if not new_name:
+        await update.message.reply_text("Название не может быть пустым.")
+        return EDIT_PROJECT_NAME
+    project_id = context.user_data["edit_project_id"]
+    project = projects_db.get(project_id)
+    if not project:
+        await update.message.reply_text("Проект не найден.")
+        return ConversationHandler.END
+    old_name = project["name"]
+    project["name"] = new_name
+    save_data()
+    await update.message.reply_text(f"✅ Проект переименован: «{old_name}» → «{new_name}»", reply_markup=get_main_keyboard())
+    await send_notification_to_project(context, project_id,
+                                       f"🔄 <b>Проект переименован</b>\nСтарое название: {old_name}\nНовое название: {new_name}")
+    return ConversationHandler.END
+
+async def delete_project_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    project_id = query.data.split("_")[-1]
+    project = projects_db.get(project_id)
+    if not project or project["owner_id"] != update.effective_user.id:
+        await query.edit_message_text("Нет прав на удаление.")
+        return
+
+    await send_to_metrika(update.effective_user.id, "/project_deleted", "Удаление проекта", {"project_name": project['name'][:50]})
+
+    to_delete = [tid for tid, t in tasks_db.items() if t["project_id"] == project_id]
+    for tid in to_delete:
+        del tasks_db[tid]
+    del projects_db[project_id]
+    save_data()
+    await query.edit_message_text(f"✅ Проект «{project['name']}» и все его задачи удалены.")
+    for uid in project["members"]:
+        if uid != update.effective_user.id:
+            try:
+                await context.bot.send_message(chat_id=uid, text=f"🗑️ <b>Проект «{project['name']}» удалён тимлидом.</b>", parse_mode="HTML")
+            except:
+                pass
+
+# ========== ПРОСМОТР ПРОЕКТА И ЗАДАЧ ==========
+async def select_project_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    project_id = query.data.split("_")[-1]
+    project = projects_db.get(project_id)
+    if not project or user_id not in project["members"]:
+        await query.edit_message_text("Нет доступа.")
+        return
+    context.user_data["current_project_id"] = project_id
+    is_owner = (project["owner_id"] == user_id)
+    text = f"📁 <b>{project['name']}</b>\n\n"
+    if is_owner:
+        text += "Тимлид:\n"
+        keyboard = [
+            [InlineKeyboardButton("➕ Создать задачу", callback_data="tl_create_task")],
+            [InlineKeyboardButton("📋 Все задачи", callback_data="view_all_tasks")],
+            [InlineKeyboardButton("🔑 Код приглашения", callback_data="show_invite_code")],
+        ]
+    else:
+        text += "Участник:\n"
+        keyboard = [[InlineKeyboardButton("✅ Мои задачи", callback_data="view_my_tasks")]]
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def view_all_tasks(update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    await send_to_metrika(user_id, "/all_tasks_viewed", "Просмотр всех задач (тимлид)")
+
+    project_id = context.user_data.get("current_project_id")
+    if not project_id:
+        await query.edit_message_text("Ошибка.")
+        return
+    project_tasks = [t for t in tasks_db.values() if t["project_id"] == project_id]
+    if not project_tasks:
+        await query.edit_message_text("Нет задач.")
+        return
+    keyboard = []
+    for task in project_tasks:
+        status = "✅" if task["completed"] else "⏳"
+        assignee = get_user_link(task["assignee_id"])
+        text = f"{status} <b>{task['title']}</b>\n  Исполнитель: {assignee}\n  Дедлайн: {format_deadline(task['deadline'])}"
+        row_buttons = []
+        row_buttons.append(InlineKeyboardButton("✏️", callback_data=f"edit_task_{task['id']}"))
+        row_buttons.append(InlineKeyboardButton("🗑️", callback_data=f"delete_task_{task['id']}"))
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"task_detail_{task['id']}"), *row_buttons])
+    await query.edit_message_text("<b>Все задачи:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def view_my_tasks(update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    await send_to_metrika(user_id, "/my_tasks_viewed", "Просмотр своих задач")
+
+    project_id = context.user_data.get("current_project_id")
+    if not project_id:
+        await query.edit_message_text("Ошибка.")
+        return
+    my_tasks = [t for t in tasks_db.values() if t["project_id"] == project_id and t["assignee_id"] == user_id]
+    if not my_tasks:
+        await query.edit_message_text("У вас нет задач в этом проекте.")
+        return
+    keyboard = []
+    for task in my_tasks:
+        status = "✓" if task["completed"] else "✗"
+        keyboard.append([InlineKeyboardButton(f"{status} {task['title']} (до {format_deadline(task['deadline'])})", callback_data=f"task_detail_{task['id']}")])
+    await query.edit_message_text("Ваши задачи:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def task_detail_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    task = tasks_db.get(task_id)
+    if not task:
+        await query.edit_message_text("Задача не найдена.")
+        return
+    user_id = update.effective_user.id
+    await send_to_metrika(user_id, "/task_detail_viewed", "Просмотр деталей задачи", {"task_id": task_id})
+
+    project = projects_db.get(task["project_id"])
+    if not project:
+        return
+    is_owner = (project["owner_id"] == user_id)
+    is_assignee = (task["assignee_id"] == user_id)
+    status = "✅ Выполнена" if task["completed"] else "⏳ Активна"
+    text = f"<b>{task['title']}</b>\nПроект: {project['name']}\nДедлайн: {format_deadline(task['deadline'])}\nСтатус: {status}"
+    keyboard = []
+    if is_assignee and not task["completed"]:
+        keyboard.append([InlineKeyboardButton("✅ Выполнено", callback_data=f"complete_task_{task_id}")])
+        keyboard.append([InlineKeyboardButton("⏰ Перенести", callback_data=f"request_postpone_{task_id}")])
+    if is_owner and not task["completed"] and not is_assignee:
+        keyboard.append([InlineKeyboardButton("📅 Изменить дедлайн", callback_data=f"tl_edit_deadline_{task_id}")])
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
+async def complete_task_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    task = tasks_db.get(task_id)
+    if not task or task["completed"]:
+        await query.edit_message_text("Задача уже выполнена или не найдена.")
+        return
+
+    await send_to_metrika(update.effective_user.id, "/task_completed", "Выполнение задачи", {"task_id": task_id})
+
+    task["completed"] = True
+    save_data()
+    await query.edit_message_text(f"✅ Задача «{task['title']}» выполнена!")
+    project = projects_db.get(task["project_id"])
+    if project:
+        assignee_link = get_user_link(task["assignee_id"])
+        await send_notification_to_project(context, task["project_id"],
+            f"✅ <b>Задача выполнена!</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nИсполнитель: {assignee_link}")
+    if context.job_queue:
+        for job in context.job_queue.jobs():
+            if job.name and job.name.startswith(f"reminder_{task_id}_"):
+                job.schedule_removal()
+
+# ========== УПРАВЛЕНИЕ ЗАДАЧАМИ (редакт/удалить) ==========
+async def edit_task_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    task = tasks_db.get(task_id)
+    if not task:
+        await query.edit_message_text("Задача не найдена.")
+        return
+    project = projects_db.get(task["project_id"])
+    if not project or project["owner_id"] != update.effective_user.id:
+        await query.edit_message_text("Только тимлид может редактировать задачу.")
+        return
+    context.user_data["edit_task_id"] = task_id
+    keyboard = [
+        [InlineKeyboardButton("✏️ Название", callback_data="edit_task_title")],
+        [InlineKeyboardButton("📅 Дедлайн", callback_data="edit_task_deadline")],
+        [InlineKeyboardButton("👤 Исполнителя", callback_data="edit_task_assignee")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_edit")]
+    ]
+    await query.edit_message_text("Что хотите изменить?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return EDIT_TASK_SELECT
+
+async def edit_task_select_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    if action == "edit_task_title":
+        await query.edit_message_text("Введите новое название задачи:")
+        return EDIT_TASK_TITLE
+    elif action == "edit_task_deadline":
+        await show_calendar(update, context, for_edit=True)
+        return EDIT_TASK_DEADLINE
+    elif action == "edit_task_assignee":
+        task_id = context.user_data["edit_task_id"]
+        task = tasks_db.get(task_id)
+        project = projects_db.get(task["project_id"])
+        members = project["members"]
+        keyboard = []
+        for uid in members:
+            user = users_db.get(uid, {})
+            name = user.get("full_name") or user.get("username") or str(uid)
+            keyboard.append([InlineKeyboardButton(name, callback_data=f"edit_assign_user_{uid}")])
+        await query.edit_message_text("Выберите нового исполнителя:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return EDIT_TASK_ASSIGNEE
+    else:
+        await query.edit_message_text("Отменено.")
+        return ConversationHandler.END
+
+async def edit_task_title(update, context):
+    new_title = update.message.text.strip()
+    if not new_title:
+        await update.message.reply_text("Название не может быть пустым.")
+        return EDIT_TASK_TITLE
+    task_id = context.user_data["edit_task_id"]
+    task = tasks_db.get(task_id)
+    old_title = task["title"]
+    task["title"] = new_title
+    save_data()
+    await update.message.reply_text(f"✅ Название задачи изменено: «{old_title}» → «{new_title}»", reply_markup=get_main_keyboard())
+    project = projects_db.get(task["project_id"])
+    await send_notification_to_project(context, task["project_id"],
+        f"✏️ <b>Задача изменена</b>\nПроект: {project['name']}\nИсполнитель: {get_user_link(task['assignee_id'])}\nНовое название: {new_title}")
+    return ConversationHandler.END
+
+async def edit_task_deadline(update, context):
+    task_id = context.user_data["edit_task_id"]
+    task = tasks_db.get(task_id)
+    old_deadline = task["deadline"]
+    new_deadline = context.user_data.get("new_deadline")
+    if not new_deadline:
+        await update.message.reply_text("Ошибка выбора даты.")
+        return ConversationHandler.END
+    task["deadline"] = new_deadline
+    save_data()
+    await schedule_reminders(context, task_id)
+    project = projects_db.get(task["project_id"])
+    await update.message.reply_text(f"✅ Дедлайн изменён на {format_deadline(new_deadline)}", reply_markup=get_main_keyboard())
+    await send_notification_to_project(context, task["project_id"],
+        f"📅 <b>Дедлайн задачи изменён</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nНовый дедлайн: {format_deadline(new_deadline)}")
+    return ConversationHandler.END
+
+async def edit_task_assignee(update, context):
+    query = update.callback_query
+    await query.answer()
+    new_assignee_id = int(query.data.split("_")[-1])
+    task_id = context.user_data["edit_task_id"]
+    task = tasks_db.get(task_id)
+    old_assignee = task["assignee_id"]
+    task["assignee_id"] = new_assignee_id
+    save_data()
+    project = projects_db.get(task["project_id"])
+    await query.edit_message_text(f"✅ Исполнитель изменён на {get_user_link(new_assignee_id)}")
+    if old_assignee != new_assignee_id:
+        await context.bot.send_message(chat_id=old_assignee,
+            text=f"🔄 <b>Задача переназначена</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nТеперь исполнитель - {get_user_link(new_assignee_id)}",
+            parse_mode="HTML")
+    await context.bot.send_message(chat_id=new_assignee_id,
+        text=f"📌 <b>Вам назначена задача</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nДедлайн: {format_deadline(task['deadline'])}",
+        parse_mode="HTML")
+    return ConversationHandler.END
+
+async def delete_task_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    task = tasks_db.get(task_id)
+    if not task:
+        await query.edit_message_text("Задача не найдена.")
+        return
+    project = projects_db.get(task["project_id"])
+    if not project or project["owner_id"] != update.effective_user.id:
+        await query.edit_message_text("Только тимлид может удалять задачи.")
+        return
+    title = task["title"]
+
+    await send_to_metrika(update.effective_user.id, "/task_deleted", "Удаление задачи", {"task_id": task_id})
+
+    del tasks_db[task_id]
+    save_data()
+    await query.edit_message_text(f"🗑️ Задача «{title}» удалена.")
+    await send_notification_to_project(context, task["project_id"],
+        f"🗑️ <b>Задача удалена</b>\nПроект: {project['name']}\nЗадача: {title}")
+
+# ========== ПЕРЕНОС ДЕДЛАЙНА ==========
+async def request_postpone_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    task = tasks_db.get(task_id)
+    if not task or task["completed"]:
+        await query.edit_message_text("Невозможно запросить перенос для выполненной задачи.")
+        return
+    context.user_data["postpone_task_id"] = task_id
+    await query.edit_message_text("Напишите причину переноса:")
+    return POSTPONE_REQUEST_REASON
+
+async def postpone_reason(update, context):
+    reason = update.message.text.strip()
+    if not reason:
+        await update.message.reply_text("Причина не может быть пустой.")
+        return POSTPONE_REQUEST_REASON
+    task_id = context.user_data["postpone_task_id"]
+    task = tasks_db.get(task_id)
+    if not task:
+        await update.message.reply_text("Ошибка.")
+        return ConversationHandler.END
+    project = projects_db.get(task["project_id"])
+    owner_id = project["owner_id"]
+    assignee_link = get_user_link(task["assignee_id"])
+
+    await send_to_metrika(update.effective_user.id, "/postpone_requested", "Запрос переноса дедлайна",
+                         {"task_id": task_id, "reason_length": len(reason)})
+
+    text = (
+        f"📩 <b>Запрос на перенос дедлайна</b>\n\n"
+        f"Проект: {project['name']}\n"
+        f"Задача: {task['title']}\n"
+        f"Исполнитель: {assignee_link}\n"
+        f"Текущий дедлайн: {format_deadline(task['deadline'])}\n"
+        f"<b>Причина:</b> {reason}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_postpone_{task_id}")],
+        [InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_postpone_{task_id}")]
+    ])
+    await context.bot.send_message(chat_id=owner_id, text=text, parse_mode="HTML", reply_markup=keyboard)
+    await update.message.reply_text("Запрос отправлен тимлиду.", reply_markup=get_main_keyboard())
+    return ConversationHandler.END
+
+async def approve_postpone_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    task = tasks_db.get(task_id)
+    if not task:
+        await query.edit_message_text("Задача не найдена.")
+        return
+    context.user_data["approve_task_id"] = task_id
+    context.user_data["calendar_next_state"] = "approve_postpone"
+    await show_calendar(update, context, for_edit=False)
+    return TL_APPROVE_NEW_DEADLINE
+
+async def set_new_deadline(update, context):
+    new_deadline = context.user_data.get("new_deadline")
+    if not new_deadline:
+        await update.message.reply_text("Ошибка выбора даты.")
+        return ConversationHandler.END
+    task_id = context.user_data["approve_task_id"]
+    task = tasks_db.get(task_id)
+    if not task:
+        await update.message.reply_text("Ошибка.")
+        return ConversationHandler.END
+    old = task["deadline"]
+    task["deadline"] = new_deadline
+    save_data()
+    await schedule_reminders(context, task_id)
+    project = projects_db.get(task["project_id"])
+
+    await send_to_metrika(update.effective_user.id, "/postpone_approved", "Одобрение переноса", {"task_id": task_id})
+
+    await context.bot.send_message(chat_id=task["assignee_id"],
+        text=f"✅ <b>Дедлайн задачи перенесён!</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nСтарый: {format_deadline(old)}\nНовый: {format_deadline(new_deadline)}",
+        parse_mode="HTML")
+    await update.message.reply_text("Дедлайн обновлён.", reply_markup=get_main_keyboard())
+    return ConversationHandler.END
+
+async def reject_postpone_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    task_id = query.data.split("_")[-1]
+    task = tasks_db.get(task_id)
+    if not task:
+        await query.edit_message_text("Задача не найдена.")
+        return
+    project = projects_db.get(task["project_id"])
+
+    await send_to_metrika(update.effective_user.id, "/postpone_rejected", "Отклонение переноса", {"task_id": task_id})
+
+    await context.bot.send_message(chat_id=task["assignee_id"],
+        text=f"❌ <b>Запрос на перенос отклонён</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nПожалуйста, выполните задачу в срок.",
+        parse_mode="HTML")
+    await query.edit_message_text("Запрос отклонён.")
+
+# ========== КАЛЕНДАРЬ ДЛЯ ВЫБОРА ДАТЫ/ВРЕМЕНИ ==========
+async def show_calendar(update, context, for_edit=False):
+    context.user_data.pop("cal_year", None)
+    context.user_data.pop("cal_month", None)
+    context.user_data.pop("cal_date", None)
+    context.user_data["calendar_for_edit"] = for_edit
+    now = datetime.now(MSK)
+    keyboard = []
+    years = [now.year, now.year+1, now.year+2]
+    row = [InlineKeyboardButton(str(y), callback_data=f"cal_year_{y}") for y in years]
+    keyboard.append(row)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = "Выберите год:"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("cal_year_"):
+        year = int(data.split("_")[2])
+        context.user_data["cal_year"] = year
+        months = [(1,"Янв"), (2,"Фев"), (3,"Мар"), (4,"Апр"), (5,"Май"), (6,"Июн"),
+                  (7,"Июл"), (8,"Авг"), (9,"Сен"), (10,"Окт"), (11,"Ноя"), (12,"Дек")]
+        keyboard = []
+        for i in range(0, 12, 3):
+            row = [InlineKeyboardButton(months[i][1], callback_data=f"cal_month_{months[i][0]}"),
+                   InlineKeyboardButton(months[i+1][1], callback_data=f"cal_month_{months[i+1][0]}"),
+                   InlineKeyboardButton(months[i+2][1], callback_data=f"cal_month_{months[i+2][0]}")]
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="cal_back_to_year")])
+        await query.edit_message_text(f"Год {year}. Выберите месяц:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("cal_month_"):
+        month = int(data.split("_")[2])
+        year = context.user_data.get("cal_year")
+        if not year:
+            await show_calendar(update, context, for_edit=context.user_data.get("calendar_for_edit", False))
+            return
+        context.user_data["cal_month"] = month
+        first_day = datetime(year, month, 1, tzinfo=MSK)
+        if month == 12:
+            last_day_num = 31
+        else:
+            last_day_num = (datetime(year, month+1, 1, tzinfo=MSK) - timedelta(days=1)).day
+        keyboard = []
+        week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+        row = [InlineKeyboardButton(day, callback_data="ignore") for day in week_days]
+        keyboard.append(row)
+        start_weekday = first_day.weekday()
+        row_days = []
+        for _ in range(start_weekday):
+            row_days.append(InlineKeyboardButton(" ", callback_data="ignore"))
+        for day in range(1, last_day_num+1):
+            row_days.append(InlineKeyboardButton(str(day), callback_data=f"cal_day_{day}"))
+            if len(row_days) == 7:
+                keyboard.append(row_days)
+                row_days = []
+        if row_days:
+            keyboard.append(row_days)
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="cal_back_to_month")])
+        await query.edit_message_text(f"{year}-{month:02d}. Выберите день:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("cal_day_"):
+        day = int(data.split("_")[2])
+        year = context.user_data.get("cal_year")
+        month = context.user_data.get("cal_month")
+        if not year or not month:
+            await query.edit_message_text("Ошибка: сначала выберите год и месяц.")
+            await show_calendar(update, context, for_edit=context.user_data.get("calendar_for_edit", False))
+            return
+        context.user_data["cal_date"] = datetime(year, month, day, tzinfo=MSK)
+        await query.edit_message_text(
+            "✅ Теперь введите время в формате **ЧЧ:ММ** (например, 14:30).\n"
+            "Просто напишите его в чат."
+        )
+        context.user_data["awaiting_time"] = True
+        return
+
+    if data == "cal_back_to_year":
+        await show_calendar(update, context, for_edit=context.user_data.get("calendar_for_edit", False))
+        return
+    if data == "cal_back_to_month":
+        year = context.user_data.get("cal_year")
+        if year:
+            months = [(1,"Янв"), (2,"Фев"), (3,"Мар"), (4,"Апр"), (5,"Май"), (6,"Июн"),
+                      (7,"Июл"), (8,"Авг"), (9,"Сен"), (10,"Окт"), (11,"Ноя"), (12,"Дек")]
+            keyboard = []
+            for i in range(0, 12, 3):
+                row = [InlineKeyboardButton(months[i][1], callback_data=f"cal_month_{months[i][0]}"),
+                       InlineKeyboardButton(months[i+1][1], callback_data=f"cal_month_{months[i+1][0]}"),
+                       InlineKeyboardButton(months[i+2][1], callback_data=f"cal_month_{months[i+2][0]}")]
+                keyboard.append(row)
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="cal_back_to_year")])
+            await query.edit_message_text(f"Год {year}. Выберите месяц:", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await show_calendar(update, context, for_edit=context.user_data.get("calendar_for_edit", False))
+        return
+    if data == "cal_back_to_day":
+        year = context.user_data.get("cal_year")
+        month = context.user_data.get("cal_month")
+        if year and month:
+            first_day = datetime(year, month, 1, tzinfo=MSK)
+            if month == 12:
+                last_day_num = 31
+            else:
+                last_day_num = (datetime(year, month+1, 1, tzinfo=MSK) - timedelta(days=1)).day
+            keyboard = []
+            week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            row = [InlineKeyboardButton(day, callback_data="ignore") for day in week_days]
+            keyboard.append(row)
+            start_weekday = first_day.weekday()
+            row_days = []
+            for _ in range(start_weekday):
+                row_days.append(InlineKeyboardButton(" ", callback_data="ignore"))
+            for day in range(1, last_day_num+1):
+                row_days.append(InlineKeyboardButton(str(day), callback_data=f"cal_day_{day}"))
+                if len(row_days) == 7:
+                    keyboard.append(row_days)
+                    row_days = []
+            if row_days:
+                keyboard.append(row_days)
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="cal_back_to_month")])
+            await query.edit_message_text(f"{year}-{month:02d}. Выберите день:", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await show_calendar(update, context, for_edit=context.user_data.get("calendar_for_edit", False))
+        return
+
+    await query.answer()
+
+async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_time"):
+        return
+
+    time_str = update.message.text.strip()
+    if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", time_str):
+        await update.message.reply_text("❌ Неверный формат. Введите время в формате **ЧЧ:ММ** (например, 14:30).")
+        return
+
+    hour, minute = map(int, time_str.split(":"))
+    date = context.user_data.get("cal_date")
+    if not date:
+        await update.message.reply_text("❌ Ошибка: дата не выбрана. Попробуйте заново.")
+        context.user_data.pop("awaiting_time", None)
+        reset_calendar_data(context)
+        return
+
+    new_deadline = MSK.localize(datetime(date.year, date.month, date.day, hour, minute))
+    context.user_data["new_deadline"] = new_deadline
+    context.user_data.pop("awaiting_time", None)
+
+    if context.user_data.get("calendar_next_state") == "approve_postpone":
+        task_id = context.user_data.get("approve_task_id")
+        task = tasks_db.get(task_id)
+        if task:
+            old = task["deadline"]
+            task["deadline"] = new_deadline
+            save_data()
+            await schedule_reminders(context, task_id)
+            project = projects_db.get(task["project_id"])
+            if project:
+                await context.bot.send_message(
+                    chat_id=task["assignee_id"],
+                    text=f"✅ <b>Дедлайн задачи перенесён!</b>\n"
+                         f"Проект: {project['name']}\n"
+                         f"Задача: {task['title']}\n"
+                         f"Старый: {format_deadline(old)}\n"
+                         f"Новый: {format_deadline(new_deadline)}",
+                    parse_mode="HTML"
+                )
+            await update.message.reply_text("✅ Дедлайн обновлён.", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text("❌ Задача не найдена.", reply_markup=get_main_keyboard())
+        reset_calendar_data(context)
+        return
+
+    if context.user_data.get("calendar_for_edit"):
+        task_id = context.user_data.get("edit_task_id")
+        task = tasks_db.get(task_id)
+        if task:
+            old_deadline = task["deadline"]
+            task["deadline"] = new_deadline
+            save_data()
+            await schedule_reminders(context, task_id)
+            project = projects_db.get(task["project_id"])
+            await update.message.reply_text(
+                f"✅ Дедлайн задачи «{task['title']}» изменён\n"
+                f"📅 Старый: {format_deadline(old_deadline)}\n"
+                f"📅 Новый: {format_deadline(new_deadline)}",
+                reply_markup=get_main_keyboard()
+            )
+            if project:
+                await send_notification_to_project(context, task["project_id"],
+                    f"📅 <b>Дедлайн задачи изменён</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nНовый дедлайн: {format_deadline(new_deadline)}")
+        else:
+            await update.message.reply_text("❌ Задача не найдена.", reply_markup=get_main_keyboard())
+        reset_calendar_data(context)
+        return
+
+    if context.user_data.get("calendar_next_state") == "task_creation":
+        project_id = context.user_data.get("temp_project_id")
+        assign_all = context.user_data.get("temp_assign_all", False)
+        title = context.user_data.get("temp_task_title")
+        deadline = new_deadline
+        project = projects_db.get(project_id) if project_id else None
+
+        if not project or not title:
+            await update.message.reply_text("❌ Ошибка: не хватает данных для создания задачи. Попробуйте снова.", reply_markup=get_main_keyboard())
+            reset_calendar_data(context)
+            return
+
+        if assign_all:
+            for uid in project["members"]:
+                task_id = str(uuid4())
+                tasks_db[task_id] = {
+                    "id": task_id,
+                    "project_id": project_id,
+                    "title": title,
+                    "assignee_id": uid,
+                    "deadline": deadline,
+                    "completed": False,
+                    "overdue_notified": False,
+                }
+                await schedule_reminders(context, task_id)
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"📌 <b>Новая задача!</b>\nПроект: {project['name']}\nЗадача: {title}\nДедлайн: {format_deadline(deadline)}",
+                    parse_mode="HTML"
+                )
+            await update.message.reply_text(f"✅ Задача «{title}» создана для всех участников.", reply_markup=get_main_keyboard())
+
+            await send_to_metrika(update.effective_user.id, "/task_created_all", "Создание задачи для всех",
+                                 {"project_id": project_id, "task_title": title[:50]})
+        else:
+            assignee_id = context.user_data.get("temp_assignee_id")
+            if not assignee_id:
+                await update.message.reply_text("❌ Ошибка: не выбран исполнитель.", reply_markup=get_main_keyboard())
+                reset_calendar_data(context)
+                return
+            task_id = str(uuid4())
+            tasks_db[task_id] = {
+                "id": task_id,
+                "project_id": project_id,
+                "title": title,
+                "assignee_id": assignee_id,
+                "deadline": deadline,
+                "completed": False,
+                "overdue_notified": False,
+            }
+            await schedule_reminders(context, task_id)
+            await context.bot.send_message(
+                chat_id=assignee_id,
+                text=f"📌 <b>Новая задача!</b>\nПроект: {project['name']}\nЗадача: {title}\nДедлайн: {format_deadline(deadline)}",
+                parse_mode="HTML"
+            )
+            await update.message.reply_text(f"✅ Задача «{title}» создана.", reply_markup=get_main_keyboard())
+
+            await send_to_metrika(update.effective_user.id, "/task_created_single", "Создание задачи",
+                                 {"assignee_id": assignee_id, "task_title": title[:50]})
+
+        save_data()
+        reset_calendar_data(context)
+        return
+
+    await update.message.reply_text(f"Дедлайн установлен: {format_deadline(new_deadline)}", reply_markup=get_main_keyboard())
+    reset_calendar_data(context)
+
+# ========== СОЗДАНИЕ ЗАДАЧ (ТИМЛИД) ==========
+async def tl_create_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    await send_to_metrika(user_id, "/task_creation_started", "Начало создания задачи")
+
+    await query.answer()
+    reset_calendar_data(context)
+    project_id = context.user_data.get("current_project_id")
+    if not project_id:
+        await query.edit_message_text("Сначала выберите проект через «Мои проекты».")
+        return
+    project = projects_db.get(project_id)
+    if project["owner_id"] != update.effective_user.id:
+        await query.edit_message_text("Только тимлид может создавать задачи.")
+        return
+    members = project["members"]
+    if not members:
+        await query.edit_message_text("В проекте нет участников. Пригласите их по ссылке.")
+        return
+
+    keyboard = []
+    keyboard.append([InlineKeyboardButton("👥 Всем участникам", callback_data="assign_all")])
+    for uid in members:
+        user = users_db.get(uid, {})
+        name = user.get("full_name") or user.get("username") or str(uid)
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"assign_user_{uid}")])
+    await query.edit_message_text("Выберите исполнителя:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def select_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    reset_calendar_data(context)
+    assignee_id = int(query.data.split("_")[-1])
+    project_id = context.user_data.get("current_project_id")
+    if not project_id:
+        await query.edit_message_text("Ошибка: проект не выбран.")
+        return
+    context.user_data["creating_task"] = True
+    context.user_data["temp_assignee_id"] = assignee_id
+    context.user_data["temp_project_id"] = project_id
+    await query.edit_message_text("Введите название задачи:")
+
+async def check_overdue_tasks(context):
+    now = datetime.now(MSK)
+    for task_id, task in tasks_db.items():
+        if task["completed"] or task.get("overdue_notified"):
+            continue
+        if task["deadline"] < now:
+            task["overdue_notified"] = True
+            save_data()
+
+            await send_to_metrika(task["assignee_id"], "/deadline_overdue", "Дедлайн просрочен", {"task_id": task_id})
+
+            project = projects_db.get(task["project_id"])
+            if project:
+                assignee_link = get_user_link(task["assignee_id"])
+                await send_notification_to_project(context, task["project_id"],
+                    f"⏰ <b>Дедлайн просрочен!</b>\nПроект: {project['name']}\nЗадача: {task['title']}\nИсполнитель: {assignee_link}\nДедлайн был: {format_deadline(task['deadline'])}")
+
+# ========== ЗАПУСК ==========
+async def main():
+    TOKEN = os.environ.get("BOT_TOKEN")
+    if not TOKEN:
+        logger.error("Токен не найден! Установите переменную окружения BOT_TOKEN")
+        return
+
+    application = Application.builder().token(TOKEN).build()
+    load_data()
+
+    # Регистрация ConversationHandler'ов
+    application.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^✨ Создать проект$"), new_project_start)],
+        states={CREATE_PROJECT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_project_name)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(request_postpone_callback, pattern="^request_postpone_")],
+        states={POSTPONE_REQUEST_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, postpone_reason)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(approve_postpone_callback, pattern="^approve_postpone_")],
+        states={TL_APPROVE_NEW_DEADLINE: []},
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_project_callback, pattern="^edit_project_")],
+        states={EDIT_PROJECT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_project_name)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_task_callback, pattern="^edit_task_")],
+        states={
+            EDIT_TASK_SELECT: [CallbackQueryHandler(edit_task_select_callback, pattern="^(edit_task_title|edit_task_deadline|edit_task_assignee|cancel_edit)$")],
+            EDIT_TASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_task_title)],
+            EDIT_TASK_DEADLINE: [],
+            EDIT_TASK_ASSIGNEE: [CallbackQueryHandler(edit_task_assignee, pattern="^edit_assign_user_")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+    ))
+
+    # Остальные хендлеры
+    application.add_handler(CallbackQueryHandler(tl_create_task_start, pattern="^tl_create_task$"))
+    application.add_handler(CallbackQueryHandler(select_assignee, pattern="^assign_user_"))
+    application.add_handler(CallbackQueryHandler(assign_all_callback, pattern="^assign_all$"))
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("join", join_project))
+
+    # ОДИН ОБРАБОТЧИК ТЕКСТА (объединённый)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unified_text_handler))
+
+    # Обработчики callback-запросов
+    application.add_handler(CallbackQueryHandler(select_project_callback, pattern="^select_project_"))
+    application.add_handler(CallbackQueryHandler(view_all_tasks, pattern="^view_all_tasks$"))
+    application.add_handler(CallbackQueryHandler(view_my_tasks, pattern="^view_my_tasks$"))
+    application.add_handler(CallbackQueryHandler(task_detail_callback, pattern="^task_detail_"))
+    application.add_handler(CallbackQueryHandler(complete_task_callback, pattern="^complete_task_"))
+    application.add_handler(CallbackQueryHandler(reject_postpone_callback, pattern="^reject_postpone_"))
+    application.add_handler(CallbackQueryHandler(postpone_reminder_callback, pattern="^postpone_reminder_"))
+    application.add_handler(CallbackQueryHandler(delay_reminder_callback, pattern="^delay_"))
+    application.add_handler(CallbackQueryHandler(delete_project_callback, pattern="^delete_project_"))
+    application.add_handler(CallbackQueryHandler(delete_task_callback, pattern="^delete_task_"))
+    application.add_handler(CallbackQueryHandler(calendar_callback, pattern="^cal_"))
+    application.add_handler(CallbackQueryHandler(lambda u, c: u.answer(), pattern="^show_invite_code$"))
+    application.add_handler(CallbackQueryHandler(lambda u, c: u.answer(), pattern="^ignore$"))
+
+    # Планировщик проверки просроченных задач
+    if application.job_queue:
+        application.job_queue.run_daily(
+            check_overdue_tasks,
+            time=datetime.strptime("00:00", "%H:%M").time(),
+            days=tuple(range(7))
+        )
+
+    logger.info("✅ Бот запущен и работает!")
+    await application.run_polling()
+
+if __name__ == "__main__":
+    # На некоторых хостингах событийный цикл уже запущен, используем try/except
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "already running" in str(e):
+            loop = asyncio.get_event_loop()
+            loop.create_task(main())
+        else:
+            raise
